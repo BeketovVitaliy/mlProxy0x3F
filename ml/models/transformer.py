@@ -1,25 +1,27 @@
 """
-TrafficTransformer — генерирует параметры трансформации трафика.
+TrafficTransformer v3 — с фиксом mode collapse.
 
-Задача: по признакам пакета предсказать {padding, delay, chunk_size}
-так, чтобы после применения этих параметров DPI-классификатор
-не смог уверенно определить тип трафика.
+Проблема v2: трансформер схлопывался в одну точку (mode collapse).
+Все входы маппились в ~[0.23, 0.21, 0.31, ...] с confidence=1.0.
 
-Архитектура:
-  Input(2) → Linear(32) → ReLU
-           → Linear(64) → ReLU
-           → Linear(32) → ReLU
-           → Linear(3)  → Sigmoid   ← выход всегда в [0, 1]
+Причина: loss минимизировал max_confidence, трансформер нашёл
+точку где классификатор уверен в другом классе и застрял там.
 
-Почему Sigmoid на выходе:
-  Нам нужны значения в диапазоне [0, 1] которые мы потом масштабируем.
-  Sigmoid это гарантирует. ReLU бы не подошёл — обрезает отрицательные,
-  Tanh даёт [-1, 1] и нужен сдвиг.
+Фиксы:
+  1. Loss теперь максимизирует ЭНТРОПИЮ распределения классов
+     (хотим чтобы все 5 классов были равновероятны ~0.2,
+      а не чтобы один класс сменился другим)
 
-Почему сеть маленькая:
-  Входных фич всего 2 (packet_size, entropy).
-  Задача простая — регрессия трёх чисел.
-  Большая сеть переобучится на синтетических данных.
+  2. Жёсткое ограничение delta: выход не может отличаться
+     от входа более чем на max_delta по каждому признаку.
+     Это физически невозможно убежать далеко от оригинала.
+
+  3. Шум при обучении (в train): разные входы → разные выходы,
+     сеть не может выучить константный маппинг.
+
+  4. Residual connection: выход = вход + small_delta.
+     Сеть учит дельту, а не абсолютные значения.
+     Это само по себе предотвращает collapse.
 """
 
 import torch
@@ -27,82 +29,150 @@ import torch.nn as nn
 
 
 class TrafficTransformer(nn.Module):
-    def __init__(self, input_size: int = 2, output_size: int = 3):
+    """
+    Residual трансформер: выход = clamp(вход + delta, 0, 1)
+
+    Сеть учит ДЕЛЬТУ (изменение признаков), а не абсолютные значения.
+    Это ключевое — нельзя выдать константу если вход разный,
+    потому что выход = вход + delta, и вход всегда разный.
+
+    max_delta ограничивает максимальное изменение каждого признака.
+    """
+
+    def __init__(self, feature_size: int = 10, max_delta: float = 0.3):
         super().__init__()
+        self.feature_size = feature_size
+        self.max_delta    = max_delta
 
-        self.network = nn.Sequential(
-            nn.Linear(input_size, 32),
-            nn.ReLU(),
+        # Сеть учит дельту
+        self.delta_net = nn.Sequential(
+            nn.Linear(feature_size, 64),
+            nn.LayerNorm(64),
+            nn.LeakyReLU(0.1),
 
-            nn.Linear(32, 64),
-            nn.ReLU(),
+            nn.Linear(64, 64),
+            nn.LayerNorm(64),
+            nn.LeakyReLU(0.1),
 
             nn.Linear(64, 32),
-            nn.ReLU(),
+            nn.LayerNorm(32),
+            nn.LeakyReLU(0.1),
 
-            nn.Linear(32, output_size),
-            nn.Sigmoid(),   # выход в [0, 1]
+            nn.Linear(32, feature_size),
+            nn.Tanh(),   # выход в [-1, 1], потом масштабируем на max_delta
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        x: (batch_size, 2) — [norm_packet_size, norm_entropy]
-        returns: (batch_size, 3) — [padding_norm, delay_norm, chunk_norm]
+        x:       (batch, 10) — исходные признаки
+        returns: (batch, 10) — модифицированные признаки
+
+        Формула: out = clamp(x + delta * max_delta, 0, 1)
+        delta ∈ [-1, 1] после Tanh
         """
-        return self.network(x)
+        delta    = self.delta_net(x) * self.max_delta
+        modified = torch.clamp(x + delta, 0.0, 1.0)
+        return modified
 
 
-# ── Loss функция ─────────────────────────────────────────────────────────────
+def extract_transform_params(original: torch.Tensor, modified: torch.Tensor) -> dict:
+    """
+    Переводит дельту признаков потока в реальные параметры трансформации.
+
+    Признаки (индексы):
+      0: mean_size  1: std_size  2: min_size  3: max_size
+      4: mean_iat   5: std_iat   6: min_iat   7: max_iat
+      8: pkt_count  9: bytes_total
+
+    Маппинг:
+      Δmean_size > 0  →  padding_bytes
+      Δmean_iat  > 0  →  delay_ms
+      Δmean_size < 0  →  chunk_size (фрагментация)
+    """
+    if original.dim() == 2:
+        original = original[0]
+        modified = modified[0]
+
+    orig = original.detach().cpu()
+    mod  = modified.detach().cpu()
+
+    delta_size = (mod[0] - orig[0]).item()
+    delta_iat  = (mod[4] - orig[4]).item()
+
+    padding_bytes = int(max(0.0, delta_size) * 1024)
+    padding_bytes = min(padding_bytes, 1024)
+
+    delay_ms = int(max(0.0, delta_iat) * 200)
+    delay_ms = min(delay_ms, 200)
+
+    if delta_size < 0:
+        frag       = min(abs(delta_size) / 0.3, 1.0)  # нормируем на max_delta
+        chunk_size = int(8192 * (1.0 - frag * 0.9))
+        chunk_size = max(chunk_size, 64)
+    else:
+        chunk_size = 0
+
+    return {"padding_bytes": padding_bytes, "delay_ms": delay_ms, "chunk_size": chunk_size}
+
+
+# ── Loss ──────────────────────────────────────────────────────────────────────
 
 class TransformerLoss(nn.Module):
     """
-    Составная функция потерь для трансформера.
+    Entropy-based adversarial loss.
 
-    Состоит из двух частей:
+    Цель: максимизировать энтропию распределения классов.
 
-    1. adversarial_loss — главная цель:
-       Минимизировать уверенность DPI-классификатора.
-       Чем ниже max_confidence классификатора — тем лучше.
-       loss_adv = mean(max_confidence(classifier(transformed_features)))
+    Энтропия равномерного распределения по 5 классам = log(5) ≈ 1.609
+    Энтропия уверенного предсказания (один класс=1.0) = 0
 
-    2. utility_loss — ограничение:
-       Трансформация не должна быть слишком агрессивной.
-       Большой padding или задержка ломают UX.
-       loss_util = mean(output²) — штрафуем за большие значения параметров.
+    Мы хотим энтропию → log(num_classes), то есть:
+      loss_adv = log(num_classes) - H(proba)  →  минимизируем это
+      При идеальном результате loss_adv = 0
 
-    Итого: loss = adversarial_loss + alpha * utility_loss
-
-    alpha контролирует баланс между "хорошо обманывать DPI"
-    и "не слишком ломать трафик".
+    Компоненты:
+      loss_adv  — (log(K) - H(p))  — главная цель
+      loss_util — L2 дельты признаков — не слишком большие изменения
+      loss_bound — штраф за выход за [0.05, 0.95] — реалистичность
     """
 
-    def __init__(self, alpha: float = 0.1):
+    def __init__(self, alpha: float = 0.5, beta: float = 0.1):
         super().__init__()
-        # alpha — вес utility loss.
-        # 0.1 = лёгкий штраф за большие параметры.
-        # Увеличь до 0.5 если трансформер выдаёт слишком большие задержки.
         self.alpha = alpha
+        self.beta  = beta
 
     def forward(
         self,
-        transformer_output: torch.Tensor,   # (batch, 3) — выход трансформера
-        classifier_confidence: torch.Tensor, # (batch,)  — уверенность DPI
+        original:  torch.Tensor,  # (batch, 10)
+        modified:  torch.Tensor,  # (batch, 10)
+        proba:     torch.Tensor,  # (batch, num_classes) — полное softmax распределение
     ) -> tuple[torch.Tensor, dict]:
-        """
-        Возвращает (total_loss, dict с компонентами для логирования).
-        """
-        # Главная цель: DPI должен быть неуверен
-        # Хотим чтобы confidence → 0, поэтому просто берём mean
-        loss_adv = classifier_confidence.mean()
 
-        # Штраф за большие параметры трансформации
-        # transformer_output уже в [0,1], поэтому mean(x²) в [0,1]
-        loss_util = (transformer_output ** 2).mean()
+        num_classes = proba.shape[-1]
+        max_entropy = torch.log(torch.tensor(float(num_classes)))
 
-        total = loss_adv + self.alpha * loss_util
+        # Энтропия Шеннона: H = -sum(p * log(p))
+        eps     = 1e-8
+        entropy = -(proba * (proba + eps).log()).sum(dim=-1)  # (batch,)
+
+        # Хотим H → max_entropy, поэтому минимизируем (max_entropy - H)
+        loss_adv = (max_entropy - entropy).mean()
+
+        # Штраф за большие изменения признаков
+        loss_util = ((modified - original) ** 2).mean()
+
+        # Штраф за выход за разумные границы
+        loss_bound = (
+            torch.relu(modified - 0.95) +
+            torch.relu(0.05 - modified)
+        ).mean()
+
+        total = loss_adv + self.alpha * loss_util + self.beta * loss_bound
 
         return total, {
             "total":       total.item(),
             "adversarial": loss_adv.item(),
+            "entropy":     entropy.mean().item(),
+            "max_entropy": max_entropy.item(),
             "utility":     loss_util.item(),
         }

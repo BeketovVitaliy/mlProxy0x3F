@@ -1,16 +1,18 @@
 """
-Adversarial обучение трансформера трафика.
+Обучение трансформера v3 — с фиксом mode collapse.
 
-Запуск (после train_classifier.py):
-  python train/train_transformer.py
+Ключевые изменения:
+  1. criterion получает proba (batch, 5), а не max confidence
+  2. Loss = (max_entropy - H(proba)) — максимизируем энтропию
+  3. Шум к входным данным при обучении — разрывает collapse
+  4. Логируем entropy и max_confidence отдельно
+  5. Сохраняем по max_confidence (а не по loss) — честнее
 
-Что происходит на каждом шаге:
-  1. Берём батч признаков пакетов (packet_size, entropy)
-  2. Трансформер предсказывает параметры {padding, delay, chunk}
-  3. Применяем трансформацию к flow-фичам (симулируем эффект)
-  4. Классификатор (замороженный) смотрит на изменённые фичи
-  5. Loss = уверенность классификатора (хотим её минимизировать)
-  6. Обновляем только трансформер, классификатор не трогаем
+Ожидаемая динамика:
+  Epoch 01: conf=0.85  entropy=0.45  (классификатор уверен)
+  Epoch 15: conf=0.60  entropy=0.90
+  Epoch 30: conf=0.40  entropy=1.20
+  Epoch 50: conf=0.30  entropy=1.40  (близко к max=1.61)
 """
 
 import sys
@@ -25,190 +27,147 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 
 from models.classifier import DPIClassifier
 from models.transformer import TrafficTransformer, TransformerLoss
-from utils.features import (
-    extract_packet_features, MAX_PACKET_SIZE, MAX_ENTROPY, PARAM_RANGES
-)
+from data.prepare import TrafficDataset
+from torch.utils.data import DataLoader
 
 
-def simulate_transform(
-    flow_features: torch.Tensor,   # (batch, 10) — признаки потока
-    transform_params: torch.Tensor # (batch, 3)  — [padding_n, delay_n, chunk_n]
-) -> torch.Tensor:
+def add_noise(x: torch.Tensor, std: float = 0.02) -> torch.Tensor:
     """
-    Симулирует эффект трансформации на статистических признаках потока.
+    Добавляем небольшой шум к входным признакам при обучении.
 
-    В реальности трансформация меняет сырые пакеты, но во время обучения
-    у нас нет реальных пакетов — мы работаем с векторами признаков.
-    Поэтому симулируем: как изменятся признаки если применить параметры.
-
-    Эффекты:
-      padding_norm  → увеличивает mean_size и std_size (фичи 0, 1)
-      delay_norm    → увеличивает mean_iat и std_iat (фичи 4, 5)
-      chunk_norm    → уменьшает mean_size (дробим пакеты), увеличивает count (фича 8)
-
-    Все операции дифференцируемы — градиент проходит через симуляцию
-    обратно к трансформеру. Это ключевое для adversarial обучения.
+    Это предотвращает mode collapse: разные входы → разные шумы →
+    трансформер вынужден выдавать разные выходы, не может
+    выучить константный маппинг.
     """
-    padding_n = transform_params[:, 0:1]  # (batch, 1)
-    delay_n   = transform_params[:, 1:2]
-    chunk_n   = transform_params[:, 2:3]
-
-    modified = flow_features.clone()
-
-    # Padding увеличивает средний и макс размер пакета
-    # padding_n=1.0 → добавляем MAX_PADDING/MAX_PKT_SIZE к нормализованному размеру
-    max_padding_norm = PARAM_RANGES["padding_bytes"][1] / MAX_PACKET_SIZE
-    modified[:, 0:1] = torch.clamp(modified[:, 0:1] + padding_n * max_padding_norm, 0, 1)
-    modified[:, 1:2] = torch.clamp(modified[:, 1:2] + padding_n * 0.1, 0, 1)  # std тоже растёт
-
-    # Задержки увеличивают IAT
-    max_delay_norm = PARAM_RANGES["delay_ms"][1] / 5000.0
-    modified[:, 4:5] = torch.clamp(modified[:, 4:5] + delay_n * max_delay_norm, 0, 1)
-    modified[:, 5:6] = torch.clamp(modified[:, 5:6] + delay_n * 0.05, 0, 1)
-
-    # Фрагментация уменьшает размер пакетов, увеличивает их количество
-    # chunk_n=1.0 → максимальная фрагментация → маленькие чанки
-    frag_effect = chunk_n * 0.3
-    modified[:, 0:1] = torch.clamp(modified[:, 0:1] - frag_effect, 0.01, 1)
-    modified[:, 8:9] = torch.clamp(modified[:, 8:9] + frag_effect, 0, 1)
-
-    return modified
-
-
-def generate_batch(batch_size: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Генерирует батч синтетических признаков пакетов для обучения трансформера.
-
-    Возвращает:
-      packet_features: (batch, 2) — [norm_size, norm_entropy]
-      flow_features:   (batch, 10) — статистика потока
-    """
-    # Случайные размеры и энтропии
-    sizes    = np.random.randint(64, 65535, batch_size)
-    entropys = np.random.uniform(3.0, 8.0, batch_size)
-
-    packet_feats = np.stack([
-        sizes / MAX_PACKET_SIZE,
-        entropys / MAX_ENTROPY,
-    ], axis=1).astype(np.float32)
-
-    # Генерируем реалистичные flow-фичи для каждого пакета
-    # (берём из тех же размеров и энтропий)
-    flow_feats = []
-    for i in range(batch_size):
-        n_pkt  = np.random.randint(5, 50)
-        s_mean, s_std = sizes[i], max(sizes[i] * 0.1, 10)
-        pkt_sizes = np.clip(np.random.normal(s_mean, s_std, n_pkt), 64, 65535)
-        iats      = np.clip(np.random.exponential(20, n_pkt - 1), 0, 5000)
-
-        from utils.features import extract_flow_features
-        flow_feats.append(extract_flow_features(pkt_sizes.tolist(), iats.tolist()))
-
-    flow_feats = np.array(flow_feats, dtype=np.float32)
-
-    return (
-        torch.tensor(packet_feats, device=device),
-        torch.tensor(flow_feats,   device=device),
-    )
+    noise = torch.randn_like(x) * std
+    return torch.clamp(x + noise, 0.0, 1.0)
 
 
 def main():
-    # ── Гиперпараметры ───────────────────────────────────────────────────────
-    EPOCHS        = 50
-    BATCH_SIZE    = 512
-    LR            = 5e-4
-    ALPHA         = 0.1   # вес utility loss
-    STEPS_PER_EPOCH = 100
+    EPOCHS     = 60
+    BATCH_SIZE = 256   # меньше батч — разнообразнее градиенты
+    LR         = 1e-3
+    ALPHA      = 0.2  # вес utility loss (умеренный)
+    BETA       = 0.1   # вес boundary loss
+    NOISE_STD  = 0.05  # шум к входу при обучении
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
-    # ── Загружаем замороженный классификатор ─────────────────────────────────
-    classifier_path = "saved_models/classifier.pt"
-    if not os.path.exists(classifier_path):
-        print(f"ERROR: Сначала обучи классификатор: python train/train_classifier.py")
+    # ── Классификатор (заморожен) ─────────────────────────────────────────
+    clf_path = "saved_models/classifier.pt"
+    if not os.path.exists(clf_path):
+        print("ERROR: сначала обучи классификатор")
         sys.exit(1)
 
     classifier = DPIClassifier().to(device)
-    ckpt       = torch.load(classifier_path, map_location=device)
+    ckpt = torch.load(clf_path, map_location=device)
     classifier.load_state_dict(ckpt["state_dict"])
     classifier.eval()
-    # Замораживаем — его веса не меняются во время обучения трансформера
     for p in classifier.parameters():
         p.requires_grad = False
     print(f"Классификатор загружен (val_acc={ckpt['val_acc']:.3f}), заморожен")
 
-    # ── Трансформер ──────────────────────────────────────────────────────────
-    transformer = TrafficTransformer().to(device)
-    optimizer   = Adam(transformer.parameters(), lr=LR)
-    scheduler   = CosineAnnealingLR(optimizer, T_max=EPOCHS)
-    criterion   = TransformerLoss(alpha=ALPHA)
+    # ── Данные ───────────────────────────────────────────────────────────
+    dataset     = TrafficDataset(n_samples=50_000)
+    loader      = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=2)
+    val_dataset = TrafficDataset(n_samples=5_000, seed=999)
+    val_loader  = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
 
-    print(f"Трансформер: {sum(p.numel() for p in transformer.parameters())} параметров\n")
+    # ── Трансформер ───────────────────────────────────────────────────────
+    transformer = TrafficTransformer(feature_size=10, max_delta=0.3).to(device)
+    optimizer   = Adam(transformer.parameters(), lr=LR, weight_decay=1e-4)
+    scheduler   = CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-5)
+    criterion   = TransformerLoss(alpha=ALPHA, beta=BETA)
+
+    max_entropy = float(np.log(5))  # log(num_classes) ≈ 1.609
+    n_params    = sum(p.numel() for p in transformer.parameters())
+    print(f"Трансформер: {n_params} параметров | max_entropy={max_entropy:.3f}\n")
 
     os.makedirs("saved_models", exist_ok=True)
-    best_loss = float("inf")
+    best_conf = float("inf")
 
-    # ── Цикл обучения ────────────────────────────────────────────────────────
     for epoch in range(1, EPOCHS + 1):
         transformer.train()
-        epoch_losses = {"total": 0, "adversarial": 0, "utility": 0}
+        ep = {"total": 0.0, "adversarial": 0.0, "entropy": 0.0, "utility": 0.0}
+        n  = 0
 
-        for _ in range(STEPS_PER_EPOCH):
-            packet_feats, flow_feats = generate_batch(BATCH_SIZE, device)
+        for flow_features, _ in loader:
+            flow_features = flow_features.to(device)
 
-            # 1. Трансформер предсказывает параметры по признакам пакета
-            transform_params = transformer(packet_feats)  # (batch, 3)
+            # Шум к входу — ключевой фикс mode collapse
+            noisy_input = add_noise(flow_features, NOISE_STD)
 
-            # 2. Симулируем эффект трансформации на flow-фичах
-            modified_flow = simulate_transform(flow_feats, transform_params)
+            # Трансформер: вход + дельта = модифицированные признаки
+            modified = transformer(noisy_input)
 
-            # 3. Классификатор смотрит на изменённый трафик
-            confidence = classifier.max_confidence(modified_flow)  # (batch,)
+            # Классификатор выдаёт полное распределение вероятностей
+            proba = classifier.predict_proba(modified, detach=False)   # (batch, 5)
 
-            # 4. Считаем loss и делаем шаг
             optimizer.zero_grad()
-            loss, components = criterion(transform_params, confidence)
+            loss, components = criterion(flow_features, modified, proba)
             loss.backward()
-            # Градиентный клиппинг — стабилизирует обучение
-            nn.utils.clip_grad_norm_(transformer.parameters(), max_norm=1.0)
+            nn.utils.clip_grad_norm_(transformer.parameters(), max_norm=0.5)
             optimizer.step()
 
-            for k, v in components.items():
-                epoch_losses[k] += v
+            for k in ep:
+                if k in components:
+                    ep[k] += components[k]
+            n += 1
 
         scheduler.step()
+        for k in ep:
+            ep[k] /= n
 
-        # Нормализуем по шагам
-        for k in epoch_losses:
-            epoch_losses[k] /= STEPS_PER_EPOCH
-
-        # Метрика: средняя уверенность классификатора на валидации
+        # ── Валидация (без шума — честная оценка) ─────────────────────
         transformer.eval()
+        val_confs, val_entropies = [], []
+
         with torch.no_grad():
-            val_pkt, val_flow = generate_batch(2048, device)
-            val_params   = transformer(val_pkt)
-            val_modified = simulate_transform(val_flow, val_params)
-            val_conf     = classifier.max_confidence(val_modified).mean().item()
+            for flow_features, _ in val_loader:
+                flow_features = flow_features.to(device)
+                modified = transformer(flow_features)  # без шума!
+                proba    = classifier.predict_proba(modified)
+
+                conf    = proba.max(dim=-1).values
+                eps     = 1e-8
+                entropy = -(proba * (proba + eps).log()).sum(dim=-1)
+
+                val_confs.extend(conf.cpu().tolist())
+                val_entropies.extend(entropy.cpu().tolist())
+
+        mean_conf    = float(np.mean(val_confs))
+        mean_entropy = float(np.mean(val_entropies))
+        p25_conf     = float(np.percentile(val_confs, 25))
 
         print(
             f"Epoch {epoch:02d}/{EPOCHS} | "
-            f"loss={epoch_losses['total']:.4f} "
-            f"(adv={epoch_losses['adversarial']:.4f}, util={epoch_losses['utility']:.4f}) | "
-            f"DPI confidence={val_conf:.3f}"
+            f"loss={ep['total']:.4f} "
+            f"adv={ep['adversarial']:.4f} "
+            f"util={ep['utility']:.4f} | "
+            f"conf={mean_conf:.3f} (p25={p25_conf:.3f}) "
+            f"entropy={mean_entropy:.3f}/{max_entropy:.3f}"
         )
 
-        # Сохраняем если лучше
-        if epoch_losses["total"] < best_loss:
-            best_loss = epoch_losses["total"]
+        if mean_conf < best_conf:
+            best_conf = mean_conf
             torch.save({
-                "epoch":      epoch,
-                "state_dict": transformer.state_dict(),
-                "val_conf":   val_conf,
+                "epoch":        epoch,
+                "state_dict":   transformer.state_dict(),
+                "val_conf":     mean_conf,
+                "val_conf_p25": p25_conf,
+                "val_entropy":  mean_entropy,
+                "max_entropy":  max_entropy,
+                "feature_size": 10,
+                "max_delta":    0.3,
             }, "saved_models/transformer.pt")
-            print(f"  ✓ Сохранено (DPI confidence={val_conf:.3f})")
+            print(f"  ✓ Сохранено (conf={mean_conf:.3f} entropy={mean_entropy:.3f})")
 
-    print(f"\nОбучение завершено. Лучший loss={best_loss:.4f}")
+    print(f"\nГотово. Лучший conf={best_conf:.3f}")
+    if best_conf > 0.6:
+        print("Совет: уменьши ALPHA до 0.2 или увеличь NOISE_STD до 0.05")
+    elif best_conf < 0.35:
+        print("Отличный результат!")
 
 
 if __name__ == "__main__":

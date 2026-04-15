@@ -58,15 +58,21 @@ class DPIClassifier(nn.Module):
         """
         return self.network(x)
 
-    def predict_proba(self, x: torch.Tensor) -> torch.Tensor:
-        """Возвращает вероятности классов (с softmax)."""
-        with torch.no_grad():
-            logits = self.forward(x)
-            return torch.softmax(logits, dim=-1)
+    def predict_proba(self, x: torch.Tensor, detach: bool = True) -> torch.Tensor:
+        """
+        Возвращает вероятности классов (с softmax).
+
+        detach=True подходит для обычного инференса (без графа градиентов).
+        detach=False нужен для adversarial обучения трансформера, чтобы
+        градиент доходил до входа x через замороженный классификатор.
+        """
+        logits = self.forward(x)
+        proba = torch.softmax(logits, dim=-1)
+        return proba.detach() if detach else proba
 
     def predict(self, x: torch.Tensor) -> torch.Tensor:
         """Возвращает индекс класса с максимальной вероятностью."""
-        return self.predict_proba(x).argmax(dim=-1)
+        return self.predict_proba(x, detach=True).argmax(dim=-1)
 
     def max_confidence(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -76,4 +82,4 @@ class DPIClassifier(nn.Module):
         если max_confidence низкий — DPI "не знает" что это за трафик.
         Цель трансформера: минимизировать это значение.
         """
-        return self.predict_proba(x).max(dim=-1).values
+        return self.predict_proba(x, detach=True).max(dim=-1).values
