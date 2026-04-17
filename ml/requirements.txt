@@ -6,3 +6,5 @@ scikit-learn>=1.3.0
 flask>=3.0.0
 requests[socks]>=2.31.0  # SOCKS5 в test_e2e (PySocks)
 tqdm>=4.65.0
+gymnasium>=0.29.0         # RL environment API
+stable-baselines3>=2.3.0  # SAC, PPO реализации
