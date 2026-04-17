@@ -1,21 +1,15 @@
 """
-Flask ML агент v2.
-
-Изменения по сравнению с v1:
-  - Трансформер принимает flow_features (10 признаков), не packet_features (2)
-  - /predict теперь принимает полный набор flow-признаков
-  - extract_transform_params() переводит дельту признаков в {padding, delay, chunk}
+Flask ML агент — HTTP API для Go прокси.
 
 Два режима вызова:
 
-  1. Простой (от Go прокси — только packet_size + entropy):
+  1. Простой (от Go прокси — packet_size + entropy):
      POST /predict {"packet_size": 1400, "entropy": 7.9}
-     → сервер сам строит типовой flow-вектор из этих двух значений
-     → возвращает {padding_bytes, delay_ms, chunk_size}
+     → возвращает {delay_ms, chunk_size}
 
   2. Полный (для тестов — все 10 признаков потока):
-     POST /predict/flow {"features": [0.21, 0.15, ...]}  (10 чисел)
-     → возвращает {padding_bytes, delay_ms, chunk_size, modified_features}
+     POST /predict/flow {"features": [0.21, 0.15, ...]}
+     → возвращает {delay_ms, chunk_size, modified_features}
 
 Запуск:
   python server/app.py
@@ -36,6 +30,7 @@ from utils.features import MAX_PACKET_SIZE, MAX_ENTROPY
 
 app   = Flask(__name__)
 model: TrafficTransformer | None = None
+model_max_delta: float = 0.5
 device = torch.device("cpu")
 lock   = threading.Lock()
 
@@ -74,7 +69,7 @@ def packet_to_flow_features(packet_size: int, entropy: float) -> np.ndarray:
 
 
 def load_model(path: str = "saved_models/transformer.pt") -> bool:
-    global model, stats
+    global model, model_max_delta, stats
     if not os.path.exists(path):
         print(f"WARN: модель не найдена: {path}")
         print("      Запусти: python train/train_transformer.py")
@@ -85,14 +80,18 @@ def load_model(path: str = "saved_models/transformer.pt") -> bool:
 
     ckpt  = torch.load(path, map_location=device, weights_only=False)
     fsize = ckpt.get("feature_size", 10)
-    model = TrafficTransformer(feature_size=fsize)
+    mdelta = ckpt.get("max_delta", 0.5)
+    model = TrafficTransformer(feature_size=fsize, max_delta=mdelta)
     model.load_state_dict(ckpt["state_dict"])
     model.eval()
     model.to(device)
+    model_max_delta = mdelta
 
     print(f"Модель загружена: {path}")
     print(f"  val_conf={ckpt.get('val_conf', '?'):.3f}  "
           f"p25={ckpt.get('val_conf_p25', '?'):.3f}  "
+          f"margin={ckpt.get('val_margin', '?')}  "
+          f"max_delta={mdelta}  "
           f"epoch={ckpt.get('epoch', '?')}")
     stats["model_loaded"] = True
     return True
@@ -121,7 +120,7 @@ def predict():
             with torch.no_grad():
                 x_mod = model(x_orig)   # (1, 10)
 
-        params = extract_transform_params(x_orig, x_mod)
+        params = extract_transform_params(x_orig, x_mod, max_delta=model_max_delta)
 
         ms = (time.time() - t0) * 1000
         stats["total_requests"] += 1
@@ -154,7 +153,7 @@ def predict_flow():
             with torch.no_grad():
                 x_mod = model(x_orig)
 
-        params = extract_transform_params(x_orig, x_mod)
+        params = extract_transform_params(x_orig, x_mod, max_delta=model_max_delta)
         params["modified_features"] = x_mod.squeeze(0).cpu().tolist()
         params["original_features"] = x_orig.squeeze(0).cpu().tolist()
 

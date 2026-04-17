@@ -58,17 +58,27 @@ class DPIClassifier(nn.Module):
         """
         return self.network(x)
 
-    def predict_proba(self, x: torch.Tensor, detach: bool = True) -> torch.Tensor:
+    def predict_proba(
+        self, x: torch.Tensor, detach: bool = True, temperature: float = 1.0,
+    ) -> torch.Tensor:
         """
         Возвращает вероятности классов (с softmax).
 
         detach=True подходит для обычного инференса (без графа градиентов).
         detach=False нужен для adversarial обучения трансформера, чтобы
         градиент доходил до входа x через замороженный классификатор.
+
+        temperature > 1 «размягчает» распределение: при T→∞ всё стремится
+        к равномерному 1/K. Это нужно при обучении трансформера, чтобы
+        градиенты не обнулялись из-за насыщенного softmax.
         """
         logits = self.forward(x)
-        proba = torch.softmax(logits, dim=-1)
+        proba = torch.softmax(logits / temperature, dim=-1)
         return proba.detach() if detach else proba
+
+    def get_logits(self, x: torch.Tensor) -> torch.Tensor:
+        """Возвращает сырые логиты (для CW-style adversarial loss)."""
+        return self.forward(x)
 
     def predict(self, x: torch.Tensor) -> torch.Tensor:
         """Возвращает индекс класса с максимальной вероятностью."""

@@ -67,6 +67,13 @@ func (h *handler) Handle(ctx context.Context) error {
 	}
 	defer remote.Close()
 
+	// TCP_NODELAY гарантирует что каждый Write уйдёт отдельным
+	// TCP сегментом. Без этого Nagle может склеить мелкие фрагменты
+	// обратно в один пакет, и DPI увидит целый ClientHello.
+	if tc, ok := remote.(*net.TCPConn); ok {
+		tc.SetNoDelay(true)
+	}
+
 	// 4. Отправляем клиенту успешный ответ
 	if err := h.sendReply(repSuccess); err != nil {
 		return err

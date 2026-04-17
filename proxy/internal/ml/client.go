@@ -1,11 +1,12 @@
 package ml
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
-	"bytes"
 	"time"
 )
 
@@ -18,15 +19,13 @@ type Client struct {
 }
 
 type Params struct {
-	PaddingBytes int
-	DelayMs      int
-	ChunkSize    int
+	DelayMs   int
+	ChunkSize int
 }
 
 var DefaultParams = Params{
-	PaddingBytes: 0,
-	DelayMs:      0,
-	ChunkSize:    0,
+	DelayMs:   0,
+	ChunkSize: 0,
 }
 
 func NewClient(addr string) (*Client, error) {
@@ -87,20 +86,18 @@ func (c *Client) GetParams(data []byte) (Params, error) {
 	}
 
 	return Params{
-		PaddingBytes: clamp(result.PaddingBytes, 0, 1024),
-		DelayMs:      clamp(result.DelayMs, 0, 200),
-		ChunkSize:    clamp(result.ChunkSize, 0, 8192),
+		DelayMs:   clamp(result.DelayMs, 0, 200),
+		ChunkSize: clamp(result.ChunkSize, 0, 8192),
 	}, nil
 }
 
 // calcEntropy считает энтропию Шеннона для байтового массива.
-// Это одна из ключевых фич для DPI — высокая энтропия = зашифрованный трафик.
 func calcEntropy(data []byte) float64 {
 	if len(data) == 0 {
 		return 0
 	}
 
-	freq := make(map[byte]int)
+	var freq [256]int
 	for _, b := range data {
 		freq[b]++
 	}
@@ -108,30 +105,13 @@ func calcEntropy(data []byte) float64 {
 	var entropy float64
 	n := float64(len(data))
 	for _, count := range freq {
-		p := float64(count) / n
-		if p > 0 {
-			entropy -= p * log2(p)
+		if count == 0 {
+			continue
 		}
+		p := float64(count) / n
+		entropy -= p * math.Log2(p)
 	}
 	return entropy
-}
-
-func log2(x float64) float64 {
-	// math.Log2 избегаем импорта math для простоты
-	const ln2 = 0.6931471805599453
-	if x <= 0 {
-		return 0
-	}
-	result := 0.0
-	for x > 1 {
-		x /= 2
-		result++
-	}
-	for x < 0.5 {
-		x *= 2
-		result--
-	}
-	return result
 }
 
 func clamp(v, min, max int) int {

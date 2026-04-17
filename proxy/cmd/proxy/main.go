@@ -14,7 +14,7 @@ import (
 
 func main() {
 	addr := flag.String("addr", "0.0.0.0:1080", "SOCKS5 listen address")
-	mlAddr := flag.String("ml", "localhost:50051", "ML agent gRPC address")
+	mlAddr := flag.String("ml", "localhost:8000", "ML agent HTTP address")
 	mlEnabled := flag.Bool("ml-enabled", false, "Enable ML transform")
 	flag.Parse()
 
